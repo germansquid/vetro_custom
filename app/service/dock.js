@@ -158,6 +158,10 @@ function Dock(options) {
     this.lastShardLaunch = null;
     this.wakeHomePending = false;
     this.wakeSeenAt = null;
+    // The greeting app (greetApp): opened once per cold boot and once per standby wake, after the same settle delay as the wake sweep.
+    this.greetBootDone = false;
+    this.greetWakePending = false;
+    this.greetWakeSeenAt = null;
     this.lastSuperviseAt = null;
     this.homeCheckedAt = null;
     this.homeIdleSince = null;
@@ -237,6 +241,10 @@ Dock.prototype.readState = function () {
             customApp: s && typeof s.customApp === 'string' && APP_ID_RE.test(s.customApp) ? s.customApp : null,
             customSince: s && typeof s.customSince === 'number' ? s.customSince : null,
             customHomeDisabled: s && s.customHomeDisabled === true,
+            // The "greeting app": with the Vetro launcher on, this app is opened once whenever the TV was off and is turned on with
+            // the power key (a cold boot, or a wake from standby), but never on a screensaver dismiss. The Vetro launcher stays on Home.
+            greetApp: s && typeof s.greetApp === 'string' && APP_ID_RE.test(s.greetApp) ? s.greetApp : null,
+            greetSince: s && typeof s.greetSince === 'number' ? s.greetSince : null,
             build: s && typeof s.build === 'string' ? s.build : null,
             buildPid: s && typeof s.buildPid === 'number' ? s.buildPid : null,
             dllStamp: s && typeof s.dllStamp === 'string' ? s.dllStamp : null,
@@ -252,7 +260,7 @@ Dock.prototype.readState = function () {
             hideTvSource: s && s.hideTvSource === true,
             // The store pill of All apps: TV-Store when it is installed (the default), or Samsung's store.
             appStore: s && s.appStore === 'samsung' ? 'samsung' : 'tvstore'};
-    } catch (e) { return {enabled: false, since: null, fixTizenTube: false, noMotion: false, volumePill: false, volumeEdge: 'left', numberPad: false, taskManager: false, cards: [], closeIdleHome: true, shownCards: null, row: null, autorunWas: null, customApp: null, customSince: null, customHomeDisabled: false,
+    } catch (e) { return {enabled: false, since: null, fixTizenTube: false, noMotion: false, volumePill: false, volumeEdge: 'left', numberPad: false, taskManager: false, cards: [], closeIdleHome: true, shownCards: null, row: null, autorunWas: null, customApp: null, customSince: null, customHomeDisabled: false, greetApp: null, greetSince: null,
         showHomeSources: this.legacy('home'), useSourceImages: this.legacy('images'), connectedSourcesOnly: false, hideTvSource: false, appStore: 'tvstore'}; }
 };
 
@@ -448,7 +456,7 @@ Dock.prototype.statusNow = function () {
     var base = {installed: this.installed(), enabled: state.enabled, since: state.since, busy: this.busy,
         error: this.lastError, failures: this.failures, homePictureClears: this.homePictureClears || 0, homePictureAgoSeconds: this.homePictureAt ? Math.round((this.now() - this.homePictureAt) / 1000) : null, apps: this.lastCatalog, fixTizenTube: state.fixTizenTube, noMotion: state.noMotion, volumePill: state.volumePill, volumeEdge: state.volumeEdge, numberPad: state.numberPad, taskManager: state.taskManager, cards: this.cardsEffective(state), cardChoices: this.cardChoices(), cardShards: this.cardShards(), cardsPaused: this.cardsPaused(state), maxCards: MAX_CARDS, closeIdleHome: state.closeIdleHome, idleHomeClears: this.idleHomeClears || 0, rowCustomised: !!state.row, showHomeSources: state.showHomeSources, useSourceImages: state.useSourceImages, connectedSourcesOnly: state.connectedSourcesOnly, hideTvSource: state.hideTvSource, appStore: state.appStore, autorunSwitchedOff: state.autorunWas === 1,
         mode: state.customApp ? 'custom' : state.enabled ? 'vetro' : 'off', customApp: state.customApp, customSince: state.customSince,
-        customHomeDisabled: state.customHomeDisabled,
+        customHomeDisabled: state.customHomeDisabled, greetApp: state.greetApp, greetSince: state.greetSince,
         entries: this.entries(), inputs: this.inputEntries(), lastShardLaunch: this.lastShardLaunch, bootTimeline: this.timeline,
         runningCheck: this.cheapBroken ? 'full' : 'cheap'};   // which check the supervision uses (see runningNow)
     return this.probe().then(function (p) {
@@ -934,6 +942,22 @@ Dock.prototype.disableCustom = function (options) {
     return this.leaveCustom(options).then(function () { return self.status(); }).finally(function () { self.busy = false; });
 };
 
+// The greeting app: an installed app opened at power-on while the Vetro launcher stays on the Home key. It is a plain
+// state change (no process to start, no TV setting touched); the open itself happens later, from showGreetApp in the
+// supervision round. The custom launcher (another app ON the Home key) and the greeting app exclude each other.
+Dock.prototype.setGreetApp = function (appId) {
+    if (typeof appId !== 'string' || !APP_ID_RE.test(appId)) return Promise.reject(new Error('Choose an app from the list'));
+    var state = this.readState();
+    if (state.customApp) return Promise.reject(new Error('The greeting app works with the Vetro launcher, not the custom launcher'));
+    this.patchState({greetApp: appId, greetSince: state.greetApp === appId ? state.greetSince : this.now()});
+    // Let it open now too, if the TV has just come up: the next supervision round sees the fresh boot/wake window.
+    return Promise.resolve(this.status());
+};
+Dock.prototype.clearGreetApp = function () {
+    this.patchState({greetApp: null, greetSince: null});
+    return Promise.resolve(this.status());
+};
+
 Dock.prototype.leaveCustom = function (options) {
     var self = this, state = this.readState();
     var home = state.customHomeDisabled && !(options && options.keepHome) ? (this.home ? this.home.restore() : Promise.reject(new Error('Samsung Home cannot be put back from here'))) : Promise.resolve();
@@ -1327,6 +1351,9 @@ function idleHomeScript(allowKill) {
 Dock.prototype.noteWake = function () {
     this.wakeHomePending = true;
     this.wakeSeenAt = this.now();
+    // A wake is a power-on from standby: let the greeting app open once, after the same settle delay.
+    this.greetWakePending = true;
+    this.greetWakeSeenAt = this.now();
 };
 
 Dock.prototype.maintainIdleHome = function (state) {
@@ -1410,6 +1437,26 @@ Dock.prototype.showAtPowerOn = function (state) {
     return this.execute(wrap(line), 6000).then(function (r) { if (r && /shown/.test(r.stdout || '')) self.mark('shownAtPowerOn'); }).catch(function () {});
 };
 
+// The greeting app at power-on. With the Vetro launcher on, the chosen app (greetApp) is opened once after the TV was off:
+//   - a cold boot (this run of the service came up with the TV, in the first minutes), or
+//   - a wake from standby (noteWake set greetWakePending; the same WAKE_HOME_DELAY_MS settle as the Home sweep).
+// It is NOT opened on a screensaver dismiss: that neither reboots nor suspends, so no cold-boot window and no wake is seen,
+// and the vconf screensaver guard is a second line in case a round coincides with the screensaver being up. The app id has
+// already passed APP_ID_RE (letters, digits, dot, underscore, hyphen), so it is safe on the command line, like custom mode.
+Dock.prototype.showGreetApp = function (state) {
+    if (!state || !state.greetApp || state.enabled !== true || state.customApp) return Promise.resolve();
+    var coldBoot = !this.greetBootDone && this.serviceStart < BOOT_WINDOW_S && this.uptime() < POWER_ON_WINDOW_S;
+    var wakeDue = this.greetWakePending && this.greetWakeSeenAt !== null && this.now() - this.greetWakeSeenAt >= WAKE_HOME_DELAY_MS;
+    if (!coldBoot && !wakeDue) return Promise.resolve();
+    // Consume the trigger before the async open, so a slow or failed open is not retried every round.
+    if (coldBoot) this.greetBootDone = true;
+    if (wakeDue) this.greetWakePending = false;
+    var app = state.greetApp, self = this;
+    var line = 'case "$(vconftool get memory/window_system/screensaver_on_off 2>/dev/null)" in *"value = True"*|*"value = TRUE"*|*"value = 1 "*) exit 0;; esac; ' +
+        '( /usr/bin/app_launcher -e ' + app + ' || /usr/bin/app_launcher -s ' + app + ' ) >/dev/null 2>&1; echo greeted';
+    return this.execute(wrap(line), 8000).then(function (r) { if (r && /greeted/.test(r.stdout || '')) self.mark('greetAppShown'); }).catch(function () {});
+};
+
 // Called every few seconds by the service, and at once when the root agent connects. Starts the
 // dock after a boot or a crash while it is switched on. It never switches the setting off: a slow
 // boot must not cost the user the launcher for good, so after repeated failures it keeps trying
@@ -1456,7 +1503,7 @@ Dock.prototype.supervise = function (agentConnected) {
             self.relisted = true; self.refreshPending = false;
             return self.launch(false).then(function () { self.failures = 0; self.superviseFailed = false; self.lastError = null; self.up(); return 'started'; });
         }
-        if (p.running) { self.failures = 0; if (self.superviseFailed) { self.superviseFailed = false; self.lastError = null; } self.up(); self.refreshCatalogLater(); return self.closeHomeOnce(p.samsungHome).then(function () { return self.maintainIdleHome(state); }).then(function () { return self.showAtPowerOn(state); }).then(function () { return 'running'; }); }
+        if (p.running) { self.failures = 0; if (self.superviseFailed) { self.superviseFailed = false; self.lastError = null; } self.up(); self.refreshCatalogLater(); return self.closeHomeOnce(p.samsungHome).then(function () { return self.maintainIdleHome(state); }).then(function () { return self.showAtPowerOn(state); }).then(function () { return self.showGreetApp(state); }).then(function () { return 'running'; }); }
         return self.launch(true).then(function () { self.failures = 0; self.superviseFailed = false; self.lastError = null; self.up(); self.refreshCatalogLater(); return 'started'; });
     }).then(function (result) {
         return custom ? self.checkCustomApp(state.customApp).then(function (gone) { return gone || result; }) : result;

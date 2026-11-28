@@ -1,6 +1,16 @@
 # Changelog
 
-## 0.7.2 — 2026-11-27
+## Unreleased (fork)
+
+### Vetro UI
+
+- **Greeting app at power-on (fork addition).** With the Vetro launcher on the Home key, a chosen app is opened once
+  whenever the TV was off and is turned on with the power key — a cold boot, or a wake from standby — while the Vetro
+  launcher stays on Home. A screensaver dismiss is never affected: it neither reboots nor suspends, so no cold-boot
+  window and no wake is seen, and a `screensaver_on_off` guard in the launch shell is a second line. Stored as `greetApp`
+  in the launcher state and set through the launcher API (`setGreet` / `clearGreet`); the open happens from the
+  supervision round via `app_launcher -e`, after the same settle delay as the Home wake sweep. Covered by
+  `app/tests/dock-greet.test.cjs`; not yet verified on a TV.
 
 ### Home Assistant (MQTT)
 
